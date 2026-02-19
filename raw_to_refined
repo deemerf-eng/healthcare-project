@@ -1,0 +1,280 @@
+AWS Glue (Spark) Job Script: RAW CSV -> REFINED Parquet for MANY datasets in one run
+UPDATED per instructor: handle ONLY missing values + duplicate records (no rejects/quarantine)
+
+What it does
+- Reads each dataset from:   s3://<RAW_BUCKET>/<RAW_PREFIX>/<dataset>/
+- Standardizes missing values (blanks, N/A, NULL, etc.) -> true nulls (string columns)
+- Drops exact duplicate rows (keeps 1 copy)
+- Writes Parquet to:         s3://<REFINED_BUCKET>/<REFINED_PREFIX>/<dataset>/
+- Overwrites output each run (good for static class project)
+- Normalizes column names (lowercase, underscores, strips special chars)
+- Adds lineage columns: _source_file, _ingested_at_utc
+- Runs all datasets listed in --DATASETS, or falls back to DEFAULT_DATASETS below
+
+Required job args
+--RAW_BUCKET
+--RAW_PREFIX
+--REFINED_BUCKET
+--REFINED_PREFIX
+
+Optional job args
+--DATASETS          Comma-separated dataset folder list (e.g. "nh_provider_info,pbj_daily_nurse_staffing")
+--WRITE_MODE        overwrite | append (default overwrite)
+--HEADER            true | false (default true)
+--DELIMITER         default ","
+--SKIP_MISSING      true | false (default true)  # if true, skip if raw path empty/missing
+"""
+
+import sys
+import re
+from datetime import datetime, timezone
+
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from pyspark.sql import types as T
+
+
+# -----------------------------
+# Defaults: your 21 dataset folders under raw/
+# -----------------------------
+DEFAULT_DATASETS = [
+    # SNF VBP (2)
+    "snf_vbp_aggregate",
+    "snf_vbp_facility",
+
+    # NH datasets (15)
+    "nh_citation_descriptions",
+    "nh_covid_vax_averages",
+    "nh_covid_vax_provider",
+    "nh_data_collection_intervals",
+    "nh_fire_safety_citations",
+    "nh_health_citations",
+    "nh_health_inspection_cutpoints_state",
+    "nh_ownership",
+    "nh_penalties",
+    "nh_provider_info",
+    "nh_quality_measure_claims",
+    "nh_quality_measure_mds",
+    "nh_state_us_averages",
+    "nh_survey_dates",
+    "nh_survey_summary",
+
+    # PBJ staffing (1)
+    "pbj_daily_nurse_staffing",
+
+    # SNF QRP (2)
+    "snf_qrp_national",
+    "snf_qrp_provider",
+
+    # Swing Bed (1)
+    "swing_bed_snf",
+]
+
+
+# -----------------------------
+# Parse required args
+# -----------------------------
+required = ["JOB_NAME", "RAW_BUCKET", "RAW_PREFIX", "REFINED_BUCKET", "REFINED_PREFIX"]
+args = getResolvedOptions(sys.argv, required)
+
+RAW_BUCKET = args["RAW_BUCKET"]
+RAW_PREFIX = args["RAW_PREFIX"].strip("/")
+REFINED_BUCKET = args["REFINED_BUCKET"]
+REFINED_PREFIX = args["REFINED_PREFIX"].strip("/")
+
+
+# -----------------------------
+# Optional args (parse safely)
+# -----------------------------
+def get_opt(name: str, default: str) -> str:
+    if f"--{name}" in sys.argv:
+        return getResolvedOptions(sys.argv, [name]).get(name, default)
+    return default
+
+WRITE_MODE = get_opt("WRITE_MODE", "overwrite").lower()
+HEADER = get_opt("HEADER", "true").lower()
+DELIMITER = get_opt("DELIMITER", ",")
+SKIP_MISSING = get_opt("SKIP_MISSING", "true").lower() == "true"
+
+datasets_raw = get_opt("DATASETS", "")
+if datasets_raw.strip():
+    DATASETS = [d.strip().strip("/") for d in datasets_raw.split(",") if d.strip()]
+else:
+    DATASETS = DEFAULT_DATASETS
+
+
+# -----------------------------
+# Spark / Glue setup
+# -----------------------------
+sc = SparkContext.getOrCreate()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def normalize_col(col: str) -> str:
+    c = col.strip().lower()
+    c = re.sub(r"[ \t\-\/]+", "_", c)
+    c = re.sub(r"[^a-z0-9_]", "", c)
+    c = re.sub(r"_+", "_", c)
+    c = c.strip("_")
+    return c if c else "col"
+
+def uniqueify(cols):
+    seen = {}
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 1
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c}_{seen[c]}")
+    return out
+
+def s3_path(bucket: str, prefix: str, dataset: str) -> str:
+    return f"s3://{bucket}/{prefix}/{dataset}/"
+
+# Missing tokens we treat as null (for STRING columns)
+MISSING_TOKENS = {"", "na", "n/a", "null", "none", ".", "nan"}
+
+def standardize_missing(df_in):
+    """
+    Convert common 'missing' tokens in string columns to actual nulls.
+    Leaves non-string columns unchanged.
+    """
+    exprs = []
+    for field in df_in.schema.fields:
+        c = field.name
+
+        # Keep lineage cols as-is
+        if c in ("_source_file", "_ingested_at_utc"):
+            exprs.append(F.col(c))
+            continue
+
+        if isinstance(field.dataType, T.StringType):
+            exprs.append(
+                F.when(
+                    F.col(c).isNull()
+                    | (F.trim(F.col(c)) == "")
+                    | (F.lower(F.trim(F.col(c))).isin(list(MISSING_TOKENS))),
+                    F.lit(None)
+                ).otherwise(F.col(c)).alias(c)
+            )
+        else:
+            exprs.append(F.col(c))
+    return df_in.select(*exprs)
+
+
+# -----------------------------
+# Main loop
+# -----------------------------
+print("RAW_BUCKET:", RAW_BUCKET)
+print("RAW_PREFIX:", RAW_PREFIX)
+print("REFINED_BUCKET:", REFINED_BUCKET)
+print("REFINED_PREFIX:", REFINED_PREFIX)
+print("WRITE_MODE:", WRITE_MODE)
+print("HEADER:", HEADER)
+print("DELIMITER:", DELIMITER)
+print("SKIP_MISSING:", SKIP_MISSING)
+print("DATASETS:", DATASETS)
+
+results = {
+    "processed": [],
+    "skipped_missing": [],
+    "failed": []
+}
+
+for dataset in DATASETS:
+    raw_path = s3_path(RAW_BUCKET, RAW_PREFIX, dataset)
+    refined_path = s3_path(REFINED_BUCKET, REFINED_PREFIX, dataset)
+
+    print("\n==============================")
+    print("DATASET:", dataset)
+    print("RAW PATH:", raw_path)
+    print("REFINED PATH:", refined_path)
+
+    try:
+        df = (
+            spark.read.format("csv")
+            .option("header", HEADER)
+            .option("inferSchema", "true")   # fine for class project
+            .option("sep", DELIMITER)
+            .option("multiLine", "true")
+            .option("quote", "\"")
+            .option("escape", "\"")
+            .load(raw_path)
+        )
+
+        # If raw path doesn't exist / empty, Spark will often throw before here.
+        # But just in case we got an empty DF:
+        if SKIP_MISSING and len(df.columns) == 0:
+            print(f"SKIP: {dataset} appears to have no columns (possibly missing/empty).")
+            results["skipped_missing"].append({"dataset": dataset, "reason": "no columns"})
+            continue
+
+        # Lineage
+        df = (
+            df.withColumn("_source_file", F.input_file_name())
+              .withColumn("_ingested_at_utc", F.lit(utc_now_iso()))
+        )
+
+        # Normalize column names (including lineage cols)
+        normalized_cols = uniqueify([normalize_col(c) for c in df.columns])
+        df = df.toDF(*normalized_cols)
+
+        # -----------------------------
+        # 1) Handle missing values (standardize tokens -> nulls)
+        # -----------------------------
+        df = standardize_missing(df)
+
+        # -----------------------------
+        # 2) Handle duplicates (drop exact duplicate rows; keep one)
+        # -----------------------------
+        before = df.count()
+        df = df.dropDuplicates()
+        after = df.count()
+        print(f"DEDUP: dropped {before - after} exact duplicate rows (kept {after}).")
+
+        # -----------------------------
+        # Write Parquet
+        # -----------------------------
+        (
+            df.write.mode(WRITE_MODE)
+              .format("parquet")
+              .save(refined_path)
+        )
+
+        print(f"OK: wrote parquet for {dataset}")
+        results["processed"].append({"dataset": dataset, "refined_path": refined_path})
+
+    except Exception as e:
+        msg = str(e)
+        if SKIP_MISSING and ("Path does not exist" in msg or "No such file or directory" in msg):
+            print(f"SKIP (missing): {dataset} — {msg}")
+            results["skipped_missing"].append({"dataset": dataset, "reason": msg})
+            continue
+
+        print(f"FAILED: {dataset} — {msg}")
+        results["failed"].append({"dataset": dataset, "error": msg})
+        # Continue processing others instead of failing whole job
+
+
+print("\n==============================")
+print("SUMMARY")
+print("Processed:", len(results["processed"]))
+print("Skipped missing:", len(results["skipped_missing"]))
+print("Failed:", len(results["failed"]))
+print("Details:", results)
+
+job.commit()
